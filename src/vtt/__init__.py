@@ -452,8 +452,9 @@ def summarize_vtt(
     output_path: str | None = None,
     model: str = "sonnet",
     system_prompt: str = SUMMARY_SYSTEM_PROMPT,
+    base_url: str = DEFAULT_BASE_URL,
 ) -> None:
-    """Summarize a VTT file using a local LLM via litellm proxy."""
+    """Summarize a VTT file using a local LLM via an OpenAI-compatible API."""
     vtt_file = Path(vtt_path)
 
     if not vtt_file.exists():
@@ -541,6 +542,133 @@ def analyze_command(vtt_path: str, sort_by: str = "speaker") -> None:
     print(analysis)
 
 
+def _generate_completion_script(shell: str) -> str:
+    """Generate a shell completion script that auto-completes models from the API."""
+    if shell == "bash":
+        return """\
+_vtt_completions() {
+    local cur prev subcmd
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    subcmd="${COMP_WORDS[1]}"
+
+    if [[ ${COMP_CWORD} -eq 1 ]]; then
+        COMPREPLY=($(compgen -W "convert summary analyze models completions" -- "$cur"))
+        return
+    fi
+
+    case "$subcmd" in
+        convert)
+            case "$prev" in
+                *) COMPREPLY=($(compgen -f -X '!*.vtt' -- "$cur"))
+                   COMPREPLY+=($(compgen -W "--output" -- "$cur")) ;;
+            esac
+            ;;
+        summary)
+            case "$prev" in
+                --model|-m) COMPREPLY=($(compgen -W "$(vtt models 2>/dev/null)" -- "$cur")) ;;
+                --prompt|-p) return ;;
+                *) COMPREPLY=($(compgen -f -X '!*.vtt' -- "$cur"))
+                   COMPREPLY+=($(compgen -W "--output --model --plan --prompt" -- "$cur")) ;;
+            esac
+            ;;
+        analyze)
+            case "$prev" in
+                --sort|-s)
+                    COMPREPLY=($(compgen -W "speaker duration words wpm" -- "$cur")) ;;
+                *) COMPREPLY=($(compgen -f -X '!*.vtt' -- "$cur"))
+                   COMPREPLY+=($(compgen -W "--sort" -- "$cur")) ;;
+            esac
+            ;;
+        completions)
+            COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
+            ;;
+    esac
+}
+complete -F _vtt_completions vtt"""
+    if shell == "zsh":
+        return """\
+#compdef vtt
+
+_vtt() {
+    local -a subcmds
+    subcmds=(convert summary analyze models completions)
+
+    _arguments -C '1:command:compadd -a subcmds' '*::arg:->args'
+
+    case $words[1] in
+        convert)
+            _arguments \\
+                '1:vtt file:_files -g "*.vtt"' \\
+                '--output[output file]:file:_files' \\
+                '-o[output file]:file:_files'
+            ;;
+        summary)
+            _arguments \\
+                '1:vtt file:_files -g "*.vtt"' \\
+                '--output[output file]:file:_files' \\
+                '-o[output file]:file:_files' \\
+                '--model[model name]:model:_vtt_models' \\
+                '-m[model name]:model:_vtt_models' \\
+                '--plan[extract action items]' \\
+                '--prompt[custom system prompt]:prompt:' \\
+                '-p[custom system prompt]:prompt:'
+            ;;
+        analyze)
+            _arguments \\
+                '1:vtt file:_files -g "*.vtt"' \\
+                '--sort[sort column]:column:(speaker duration words wpm)' \\
+                '-s[sort column]:column:(speaker duration words wpm)'
+            ;;
+        completions)
+            _arguments '1:shell:(bash zsh fish)'
+            ;;
+    esac
+}
+
+_vtt_models() {
+    local -a models
+    models=(${(f)"$(vtt models 2>/dev/null)"})
+    compadd -a models
+}
+
+_vtt"""
+    if shell == "fish":
+        return """\
+# disable default file completions
+complete -c vtt -f
+
+# global options
+complete -c vtt -n '__fish_use_subcommand' -s h -l help -d 'show help'
+
+# subcommands
+complete -c vtt -n '__fish_use_subcommand' -a convert -d 'convert VTT to plain text'
+complete -c vtt -n '__fish_use_subcommand' -a summary -d 'summarize VTT via LLM'
+complete -c vtt -n '__fish_use_subcommand' -a analyze -d 'analyze speaker statistics'
+complete -c vtt -n '__fish_use_subcommand' -a models -d 'list available models'
+complete -c vtt -n '__fish_use_subcommand' -a completions -d 'generate shell completions'
+
+# convert options
+complete -c vtt -n '__fish_seen_subcommand_from convert' -s o -l output -r -F
+complete -c vtt -n '__fish_seen_subcommand_from convert' -F -a '(__fish_complete_suffix .vtt)'
+
+# summary options
+complete -c vtt -n '__fish_seen_subcommand_from summary' -s o -l output -r -F
+complete -c vtt -n '__fish_seen_subcommand_from summary' -s m -l model -a '(vtt models 2>/dev/null)'
+complete -c vtt -n '__fish_seen_subcommand_from summary' -s p -l prompt -d 'custom prompt'
+complete -c vtt -n '__fish_seen_subcommand_from summary' -l plan -d 'extract action items'
+complete -c vtt -n '__fish_seen_subcommand_from summary' -F -a '(__fish_complete_suffix .vtt)'
+
+# analyze options
+complete -c vtt -n '__fish_seen_subcommand_from analyze' \\
+    -s s -l sort -a 'speaker duration words wpm'
+complete -c vtt -n '__fish_seen_subcommand_from analyze' -F -a '(__fish_complete_suffix .vtt)'
+
+# completions shell type
+complete -c vtt -n '__fish_seen_subcommand_from completions' -a 'bash zsh fish'"""
+    return ""
+
+
 def main() -> None:
     """CLI entry point with subcommands."""
     parser = argparse.ArgumentParser(
@@ -580,6 +708,11 @@ def main() -> None:
         "-p",
         help="custom system prompt",
     )
+    summary_parser.add_argument(
+        "--base-url",
+        default=DEFAULT_BASE_URL,
+        help=f"OpenAI-compatible API base URL (default: {DEFAULT_BASE_URL})",
+    )
 
     # analyze subcommand
     analyze_parser = subparsers.add_parser(
@@ -596,9 +729,25 @@ def main() -> None:
     )
 
     # models subcommand
-    subparsers.add_parser(
+    models_parser = subparsers.add_parser(
         "models",
-        help="list available models from litellm proxy",
+        help="list available models",
+    )
+    models_parser.add_argument(
+        "--base-url",
+        default=DEFAULT_BASE_URL,
+        help=f"OpenAI-compatible API base URL (default: {DEFAULT_BASE_URL})",
+    )
+
+    # completions subcommand — emit shell completion script
+    completions_parser = subparsers.add_parser(
+        "completions",
+        help="generate shell completion script",
+    )
+    completions_parser.add_argument(
+        "shell",
+        choices=["bash", "zsh", "fish"],
+        help="shell type",
     )
 
     args = parser.parse_args()
@@ -626,6 +775,8 @@ def main() -> None:
             sys.exit(1)
         for model_name in models:
             print(model_name)
+    elif args.command == "completions":
+        print(_generate_completion_script(args.shell))
 
 
 if __name__ == "__main__":
