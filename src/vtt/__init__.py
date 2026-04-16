@@ -2,13 +2,39 @@
 """VTT file toolkit - convert and analyze WebVTT files."""
 
 import argparse
+import json
 import re
 import sys
+import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 
 type Entry = tuple[str, str, str]
 type GroupedEntries = list[list[Entry]]
+
+DEFAULT_BASE_URL = "http://localhost:4000/v1"
+
+SUMMARY_SYSTEM_PROMPT = """\
+You are a meeting summarizer. Given a transcript, produce a concise summary with:
+
+1. Overview: 1-2 sentence summary of the meeting topic and outcome
+2. Key Points: Bulleted list of main discussion points
+3. Action Items: Any tasks, decisions, or follow-ups mentioned
+4. Participants: Brief note on each speaker's role/contribution
+
+Keep it concise. Use plain text, no markdown headers. Bullet points with dashes.\
+"""
+
+PLAN_SYSTEM_PROMPT = """\
+You are a meeting analyst focused on extracting actionable outcomes. Given a transcript, produce:
+
+1. Decisions: What was decided, by whom
+2. Action Items: Each with owner, deadline if mentioned, and description
+3. Open Questions: Unresolved items that need follow-up
+4. Next Steps: What happens next, any scheduled follow-ups
+
+Keep it concise. Use plain text, no markdown headers. Bullet points with dashes.\
+"""
 
 
 def normalize_speaker(name: str) -> str:
@@ -137,6 +163,14 @@ def format_output_filename(vtt_path: Path) -> str:
     return f"{date_str}__{stem}.txt"
 
 
+def format_summary_filename(vtt_path: Path) -> str:
+    """Generate default summary filename: YYYY-MM-DD__original_stem.summary.txt"""
+    mtime = vtt_path.stat().st_mtime
+    date_str = datetime.fromtimestamp(mtime, tz=UTC).strftime("%Y-%m-%d")
+    stem = vtt_path.stem.lower().replace(" ", "-")
+    return f"{date_str}__{stem}.summary.txt"
+
+
 def convert_vtt_to_txt(vtt_path: str, output_path: str | None = None) -> None:
     """Convert a VTT file to IRC-style timestamped text."""
     vtt_file = Path(vtt_path)
@@ -166,6 +200,82 @@ def convert_vtt_to_txt(vtt_path: str, output_path: str | None = None) -> None:
     print(f"{output_path}")
 
 
+def summarize_vtt(
+    vtt_path: str,
+    output_path: str | None = None,
+    model: str = "sonnet",
+    system_prompt: str = SUMMARY_SYSTEM_PROMPT,
+) -> None:
+    """Summarize a VTT file using a local LLM via litellm proxy."""
+    vtt_file = Path(vtt_path)
+
+    if not vtt_file.exists():
+        print(f"[error] file '{vtt_path}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    entries = parse_vtt(str(vtt_file))
+
+    if not entries:
+        print(f"[error] no entries found in '{vtt_path}'", file=sys.stderr)
+        sys.exit(1)
+
+    # build the transcript text for the LLM
+    grouped = group_consecutive_messages(entries)
+    header = format_header(vtt_file, entries)
+    body = format_body(grouped)
+    transcript_text = f"{header}\n\n{body}\n"
+
+    # call LLM via OpenAI-compatible API — no sdk needed
+    request_body = json.dumps(
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": transcript_text},
+            ],
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(
+        f"{DEFAULT_BASE_URL}/chat/completions",
+        data=request_body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(request) as response:
+        response_data = json.loads(response.read().decode("utf-8"))
+
+    summary_content = response_data["choices"][0]["message"]["content"]
+
+    # build output metadata
+    mtime = vtt_file.stat().st_mtime
+    date_str = datetime.fromtimestamp(mtime, tz=UTC).strftime("%Y-%m-%d")
+    duration = get_vtt_duration_minutes(vtt_file)
+    speakers = extract_speakers(entries)
+    speaker_list = ", ".join(speakers)
+    source = vtt_file.name
+
+    summary_header = "\n".join(
+        [
+            f"# date: {date_str}",
+            f"# duration: {duration} min",
+            f"# speakers: {speaker_list}",
+            f"# source: {source}",
+            "# type: summary",
+        ]
+    )
+    output_text = f"{summary_header}\n\n{summary_content}\n"
+
+    if output_path is None:
+        output_path = format_summary_filename(vtt_file)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(output_text)
+
+    print(f"{output_path}")
+
+
 def main() -> None:
     """CLI entry point with subcommands."""
     parser = argparse.ArgumentParser(
@@ -182,6 +292,30 @@ def main() -> None:
     convert_parser.add_argument("vtt_file", help="path to VTT file")
     convert_parser.add_argument("--output", "-o", help="output file path")
 
+    # summary subcommand
+    summary_parser = subparsers.add_parser(
+        "summary",
+        help="summarize VTT via LLM",
+    )
+    summary_parser.add_argument("vtt_file", help="path to VTT file")
+    summary_parser.add_argument("--output", "-o", help="output file path")
+    summary_parser.add_argument(
+        "--model",
+        "-m",
+        default="sonnet",
+        help="model name (default: sonnet)",
+    )
+    summary_parser.add_argument(
+        "--plan",
+        action="store_true",
+        help="extract action items and decisions",
+    )
+    summary_parser.add_argument(
+        "--prompt",
+        "-p",
+        help="custom system prompt",
+    )
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -190,6 +324,14 @@ def main() -> None:
 
     if args.command == "convert":
         convert_vtt_to_txt(args.vtt_file, args.output)
+    elif args.command == "summary":
+        if args.prompt:
+            system_prompt = args.prompt
+        elif args.plan:
+            system_prompt = PLAN_SYSTEM_PROMPT
+        else:
+            system_prompt = SUMMARY_SYSTEM_PROMPT
+        summarize_vtt(args.vtt_file, args.output, args.model, system_prompt, args.base_url)
 
 
 if __name__ == "__main__":
