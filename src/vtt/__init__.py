@@ -16,6 +16,20 @@ type TimedEntry = tuple[str, str, float, str]  # (timestamp, speaker, duration_s
 
 DEFAULT_BASE_URL = "http://localhost:4000/v1"
 
+
+def fetch_models(base_url: str = DEFAULT_BASE_URL) -> list[str]:
+    """Fetch available model names from an OpenAI-compatible API. Returns empty list on failure."""
+    try:
+        request = urllib.request.Request(f"{base_url}/models")
+        with urllib.request.urlopen(request, timeout=2) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        # filter out wildcard aliases (e.g. "sonnet*") — keep clean names only
+        models = [m["id"] for m in data.get("data", []) if not m["id"].endswith("*")]
+        return sorted(models)
+    except urllib.error.URLError, TimeoutError, KeyError:
+        return []
+
+
 SUMMARY_SYSTEM_PROMPT = """\
 You are a meeting summarizer. Given a transcript, produce a concise summary with:
 
@@ -458,7 +472,7 @@ def summarize_vtt(
     body = format_body(grouped)
     transcript_text = f"{header}\n\n{body}\n"
 
-    # call litellm proxy directly via stdlib — no sdk needed
+    # call LLM via OpenAI-compatible API — no sdk needed
     request_body = json.dumps(
         {
             "model": model,
@@ -470,7 +484,7 @@ def summarize_vtt(
     ).encode("utf-8")
 
     request = urllib.request.Request(
-        f"{DEFAULT_BASE_URL}/chat/completions",
+        f"{base_url}/chat/completions",
         data=request_body,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -581,6 +595,12 @@ def main() -> None:
         help="sort by column (default: speaker)",
     )
 
+    # models subcommand
+    subparsers.add_parser(
+        "models",
+        help="list available models from litellm proxy",
+    )
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -596,9 +616,16 @@ def main() -> None:
             system_prompt = PLAN_SYSTEM_PROMPT
         else:
             system_prompt = SUMMARY_SYSTEM_PROMPT
-        summarize_vtt(args.vtt_file, args.output, args.model, system_prompt)
+        summarize_vtt(args.vtt_file, args.output, args.model, system_prompt, args.base_url)
     elif args.command == "analyze":
         analyze_command(args.vtt_file, args.sort)
+    elif args.command == "models":
+        models = fetch_models(args.base_url)
+        if not models:
+            print(f"[error] could not reach API at {args.base_url}", file=sys.stderr)
+            sys.exit(1)
+        for model_name in models:
+            print(model_name)
 
 
 if __name__ == "__main__":
