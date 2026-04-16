@@ -14,7 +14,7 @@ A Python CLI toolkit for working with WebVTT transcript files. Convert to plain 
 
 - Python 3.14+
 - [uv](https://docs.astral.sh/uv/) (package manager)
-- [litellm proxy](https://docs.litellm.ai/) on `localhost:4000` or any OpenAI-compatible API (optional, for `summary` and `models` commands)
+- An LLM backend: [litellm](https://docs.litellm.ai/), [Ollama](https://ollama.com/), or any OpenAI-compatible API (optional, for `summary` and `models` commands). Auto-detected by process name; override with `--base-url`.
 
 ## Installation
 
@@ -66,15 +66,17 @@ Total          4680  1h 14m 00s    63  100.0
 
 ### Summarize with LLM
 
+Auto-detects a running LLM backend (litellm, ollama) by checking processes. Use `--base-url` to override.
+
 ```bash
-vtt summary meeting.vtt
+vtt summary meeting.vtt                     # auto-detects litellm or ollama
 vtt summary meeting.vtt --model sonnet
 vtt summary meeting.vtt --plan              # extract action items and decisions
 vtt summary meeting.vtt --prompt "List only the action items"
 
-# use Ollama or any OpenAI-compatible API
-vtt summary meeting.vtt --base-url http://localhost:11434/v1 --model llama3
-vtt models --base-url http://localhost:11434/v1
+# explicit endpoint
+vtt summary meeting.vtt --base-url http://localhost:8080/v1 --model llama3
+vtt models --base-url http://localhost:8080/v1
 ```
 
 ### List available models

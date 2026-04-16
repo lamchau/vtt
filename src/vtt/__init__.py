@@ -4,6 +4,7 @@
 import argparse
 import json
 import re
+import subprocess
 import sys
 import unicodedata
 import urllib.request
@@ -13,6 +14,39 @@ from pathlib import Path
 type Entry = tuple[str, str, str]
 type GroupedEntries = list[list[Entry]]
 type TimedEntry = tuple[str, str, float, str]  # (timestamp, speaker, duration_seconds, text)
+
+# process names to look for when auto-detecting LLM backends
+KNOWN_BACKENDS = ["litellm", "ollama"]
+
+
+def _find_listening_port(process_name: str) -> int | None:
+    """Find the port a process is listening on via lsof."""
+    try:
+        result = subprocess.run(
+            ["lsof", "-iTCP", "-sTCP:LISTEN", "-nP"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if process_name in line.lower():
+                # lsof format: "... *:PORT (LISTEN)" or "... localhost:PORT (LISTEN)"
+                for part in line.split():
+                    if ":" in part and part.split(":")[-1].isdigit():
+                        return int(part.split(":")[-1])
+    except OSError, subprocess.TimeoutExpired:
+        pass
+    return None
+
+
+def detect_base_url() -> str | None:
+    """Detect a running LLM backend by checking processes and their listening ports."""
+    for process_name in KNOWN_BACKENDS:
+        port = _find_listening_port(process_name)
+        if port is not None:
+            return f"http://localhost:{port}/v1"
+    return None
+
 
 DEFAULT_BASE_URL = "http://localhost:4000/v1"
 
@@ -710,8 +744,8 @@ def main() -> None:
     )
     summary_parser.add_argument(
         "--base-url",
-        default=DEFAULT_BASE_URL,
-        help=f"OpenAI-compatible API base URL (default: {DEFAULT_BASE_URL})",
+        default=None,
+        help="OpenAI-compatible API base URL (auto-detects litellm/ollama if omitted)",
     )
 
     # analyze subcommand
@@ -735,8 +769,8 @@ def main() -> None:
     )
     models_parser.add_argument(
         "--base-url",
-        default=DEFAULT_BASE_URL,
-        help=f"OpenAI-compatible API base URL (default: {DEFAULT_BASE_URL})",
+        default=None,
+        help="OpenAI-compatible API base URL (auto-detects litellm/ollama if omitted)",
     )
 
     # completions subcommand — emit shell completion script
@@ -759,19 +793,37 @@ def main() -> None:
     if args.command == "convert":
         convert_vtt_to_txt(args.vtt_file, args.output)
     elif args.command == "summary":
+        base_url = args.base_url
+        if base_url is None:
+            base_url = detect_base_url()
+        if base_url is None:
+            print(
+                "[error] no LLM backend detected (looked for litellm, ollama processes)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         if args.prompt:
             system_prompt = args.prompt
         elif args.plan:
             system_prompt = PLAN_SYSTEM_PROMPT
         else:
             system_prompt = SUMMARY_SYSTEM_PROMPT
-        summarize_vtt(args.vtt_file, args.output, args.model, system_prompt, args.base_url)
+        summarize_vtt(args.vtt_file, args.output, args.model, system_prompt, base_url)
     elif args.command == "analyze":
         analyze_command(args.vtt_file, args.sort)
     elif args.command == "models":
-        models = fetch_models(args.base_url)
+        base_url = args.base_url
+        if base_url is None:
+            base_url = detect_base_url()
+        if base_url is None:
+            print(
+                "[error] no LLM backend detected (looked for litellm, ollama processes)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        models = fetch_models(base_url)
         if not models:
-            print(f"[error] could not reach API at {args.base_url}", file=sys.stderr)
+            print(f"[error] could not reach API at {base_url}", file=sys.stderr)
             sys.exit(1)
         for model_name in models:
             print(model_name)
