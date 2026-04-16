@@ -10,10 +10,11 @@ import unicodedata
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TypeAlias
 
-type Entry = tuple[str, str, str]
-type GroupedEntries = list[list[Entry]]
-type TimedEntry = tuple[str, str, float, str]  # (timestamp, speaker, duration_seconds, text)
+Entry: TypeAlias = tuple[str, str, str]
+GroupedEntries: TypeAlias = list[list[Entry]]
+TimedEntry: TypeAlias = tuple[str, str, float, str]  # (timestamp, speaker, duration_seconds, text)
 
 # process names to look for when auto-detecting LLM backends
 KNOWN_BACKENDS = ["litellm", "ollama"]
@@ -34,7 +35,7 @@ def _find_listening_port(process_name: str) -> int | None:
                 for part in line.split():
                     if ":" in part and part.split(":")[-1].isdigit():
                         return int(part.split(":")[-1])
-    except OSError, subprocess.TimeoutExpired:
+    except (OSError, subprocess.TimeoutExpired):
         pass
     return None
 
@@ -60,7 +61,7 @@ def fetch_models(base_url: str = DEFAULT_BASE_URL) -> list[str]:
         # filter out wildcard aliases (e.g. "sonnet*") — keep clean names only
         models = [m["id"] for m in data.get("data", []) if not m["id"].endswith("*")]
         return sorted(models)
-    except urllib.error.URLError, TimeoutError, KeyError:
+    except (urllib.error.URLError, TimeoutError, KeyError):
         return []
 
 

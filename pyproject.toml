@@ -23,7 +23,7 @@ dev = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py314"
+target-version = "py313"  # ruff: keep py313 compat syntax until mypy supports PEP 695/758
 exclude = [".venv"]
 src = ["src"]
 
@@ -40,7 +40,7 @@ select = [
     "SIM",    # flake8-simplify
     "RUF",    # ruff-specific rules
 ]
-ignore = []
+ignore = ["UP040"]  # TypeAlias style — mypy doesn't support PEP 695 yet
 
 [tool.ruff.lint.per-file-ignores]
 "tests/test_*.py" = ["S101"]  # Allow assert in tests
@@ -51,5 +51,10 @@ python_files = ["test_*.py"]
 python_functions = ["test_*"]
 
 [tool.mypy]
+python_version = "3.14"
 mypy_path = "src"
 exclude = ["build"]
+
+[[tool.mypy.overrides]]
+module = "pytest"
+ignore_missing_imports = true
