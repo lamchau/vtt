@@ -20,6 +20,23 @@ typecheck:
 
 check: clean format fix typecheck test
 
+bump part="patch":
+    #!/usr/bin/env bash
+    current=$(grep '^version' pyproject.toml | sed 's/.*"\(.*\)"/\1/')
+    IFS='.' read -r major minor patch <<< "$current"
+    case "{{part}}" in
+    major) major=$((major + 1)); minor=0; patch=0 ;;
+    minor) minor=$((minor + 1)); patch=0 ;;
+    patch) patch=$((patch + 1)) ;;
+    *)
+        echo "[error] invalid part: {{part}} (expected major, minor, or patch)" >&2
+        exit 1
+        ;;
+    esac
+    new="${major}.${minor}.${patch}"
+    sd '^version = ".*"' "version = \"${new}\"" pyproject.toml
+    echo "${current} -> ${new}"
+
 install shell=`basename "$SHELL"`: check
     uv tool install --force --reinstall .
     just install-completions {{shell}}
