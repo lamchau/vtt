@@ -5,12 +5,14 @@ import argparse
 import json
 import re
 import sys
+import unicodedata
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 
 type Entry = tuple[str, str, str]
 type GroupedEntries = list[list[Entry]]
+type TimedEntry = tuple[str, str, float, str]  # (timestamp, speaker, duration_seconds, text)
 
 DEFAULT_BASE_URL = "http://localhost:4000/v1"
 
@@ -44,6 +46,64 @@ def normalize_speaker(name: str) -> str:
     if len(parts) == 1:
         return f"{parts[0]} MISSING_SURNAME"
     return name
+
+
+def _is_cjk(char: str) -> bool:
+    """Check if a character is CJK (Chinese, Japanese, Korean)."""
+    category = unicodedata.category(char)
+    # Lo = "Letter, other" covers CJK ideographs; also check common CJK ranges
+    if category == "Lo":
+        codepoint = ord(char)
+        # CJK unified ideographs + extensions, kana, hangul, etc.
+        is_cjk_range = (
+            0x4E00 <= codepoint <= 0x9FFF  # CJK unified ideographs
+            or 0x3400 <= codepoint <= 0x4DBF  # CJK extension A
+            or 0x3040 <= codepoint <= 0x309F  # hiragana
+            or 0x30A0 <= codepoint <= 0x30FF  # katakana
+            or 0xAC00 <= codepoint <= 0xD7AF  # hangul syllables
+            or 0x20000 <= codepoint <= 0x2A6DF  # CJK extension B
+        )
+        return is_cjk_range
+    return False
+
+
+def count_words(text: str) -> int:
+    """Count words with CJK awareness.
+
+    Each CJK character counts as one word. Non-CJK text is split
+    on whitespace. Mixed text handles both correctly.
+    """
+    word_count = 0
+    current_token = ""
+
+    for char in text:
+        if _is_cjk(char):
+            # flush any accumulated non-CJK token
+            if current_token.strip():
+                word_count += len(current_token.split())
+            current_token = ""
+            # each CJK character counts as one word
+            word_count += 1
+        else:
+            current_token += char
+
+    # flush remaining non-CJK token
+    if current_token.strip():
+        word_count += len(current_token.split())
+
+    return word_count
+
+
+def _parse_timestamp_seconds(timestamp_str: str) -> float:
+    """Parse a VTT timestamp like '00:00:03.323' into total seconds."""
+    match = re.match(r"(\d{2}):(\d{2}):(\d{2})\.(\d+)", timestamp_str)
+    if not match:
+        return 0.0
+    hours = int(match.group(1))
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+    milliseconds = int(match.group(4))
+    return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000
 
 
 def parse_vtt(vtt_path: str) -> list[Entry]:
@@ -81,6 +141,54 @@ def parse_vtt(vtt_path: str) -> list[Entry]:
         i += 1
 
     return entries
+
+
+def parse_vtt_with_duration(vtt_path: str) -> list[TimedEntry]:
+    """Parse VTT file into list of (timestamp, speaker, duration_seconds, text) entries."""
+    timed_entries: list[TimedEntry] = []
+    with open(vtt_path, encoding="utf-8") as f:
+        lines = f.readlines()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+
+        # match the timestamp line: "00:00:03.323 --> 00:00:06.915"
+        arrow_match = re.match(
+            r"(\d{2}:\d{2}:\d{2}\.\d+)\s+-->\s+(\d{2}:\d{2}:\d{2}\.\d+)",
+            line,
+        )
+        if arrow_match:
+            start_full = arrow_match.group(1)
+            end_full = arrow_match.group(2)
+            # truncate to HH:MM:SS for display timestamp
+            timestamp = start_full[:8]
+            start_seconds = _parse_timestamp_seconds(start_full)
+            end_seconds = _parse_timestamp_seconds(end_full)
+            duration_seconds = end_seconds - start_seconds
+
+            i += 1
+            content_lines: list[str] = []
+            while i < len(lines):
+                content_line = lines[i]
+                if "</v>" in content_line or not content_line.strip():
+                    content_lines.append(content_line)
+                    break
+                content_lines.append(content_line)
+                i += 1
+
+            full_content = "".join(content_lines)
+
+            if speaker_match := re.match(r"<v ([^>]+)>(.*)</v>", full_content, re.DOTALL):
+                raw_name = speaker_match.group(1)
+                speaker = normalize_speaker(raw_name)
+                text = speaker_match.group(2).strip()
+                text = " ".join(text.split())
+                timed_entries.append((timestamp, speaker, duration_seconds, text))
+
+        i += 1
+
+    return timed_entries
 
 
 def group_consecutive_messages(entries: list[Entry]) -> GroupedEntries:
@@ -171,6 +279,131 @@ def format_summary_filename(vtt_path: Path) -> str:
     return f"{date_str}__{stem}.summary.txt"
 
 
+def analyze_speakers(
+    entries: list[TimedEntry],
+    vtt_path: Path,
+    sort_by: str = "speaker",
+) -> str:
+    """Produce a formatted speaker analysis table from timed entries."""
+    duration_minutes = get_vtt_duration_minutes(vtt_path)
+    source_name = vtt_path.name
+
+    # collect per-speaker stats
+    speaker_order: list[str] = []
+    speaker_word_counts: dict[str, int] = {}
+    speaker_durations: dict[str, float] = {}
+
+    for _, speaker, duration_seconds, text in entries:
+        if speaker not in speaker_word_counts:
+            speaker_order.append(speaker)
+            speaker_word_counts[speaker] = 0
+            speaker_durations[speaker] = 0.0
+
+        speaker_word_counts[speaker] += count_words(text)
+        speaker_durations[speaker] += duration_seconds
+
+    total_words = sum(speaker_word_counts.values())
+    total_duration_seconds = sum(speaker_durations.values())
+
+    # compute wpm and percentage for each speaker
+    speaker_wpm: dict[str, int] = {}
+    speaker_pct: dict[str, int] = {}
+    for speaker in speaker_order:
+        duration_min = speaker_durations[speaker] / 60
+        if duration_min > 0:
+            speaker_wpm[speaker] = round(speaker_word_counts[speaker] / duration_min)
+        else:
+            speaker_wpm[speaker] = 0
+
+        if total_duration_seconds > 0:
+            speaker_pct[speaker] = round(speaker_durations[speaker] / total_duration_seconds * 100)
+        else:
+            speaker_pct[speaker] = 0
+
+    if total_duration_seconds > 0:
+        total_wpm = round(total_words / (total_duration_seconds / 60))
+    else:
+        total_wpm = 0
+
+    # sort speakers by requested column (descending for numeric, ascending for name)
+    if sort_by == "duration":
+        speaker_order.sort(key=lambda s: speaker_durations[s], reverse=True)
+    elif sort_by == "words":
+        speaker_order.sort(key=lambda s: speaker_word_counts[s], reverse=True)
+    elif sort_by == "wpm":
+        speaker_order.sort(
+            key=lambda s: speaker_wpm[s],
+            reverse=True,
+        )
+    else:
+        # default: sort alphabetically by speaker name
+        speaker_order.sort()
+
+    # calculate column widths dynamically
+    speaker_col_label = "Speaker"
+    all_names = [*speaker_order, "Total"]
+    name_width = max(len(speaker_col_label), max(len(name) for name in all_names))
+
+    words_col_label = "Words"
+    duration_col_label = "Duration"
+    wpm_col_label = "WPM"
+    pct_col_label = "%"
+    words_width = max(len(words_col_label), len(str(total_words)))
+    duration_width = len(duration_col_label)
+    wpm_width = max(len(wpm_col_label), len(str(total_wpm)))
+    pct_width = max(len(pct_col_label), 4)  # "100%" is 4 chars
+
+    # build the header line
+    header_line = (
+        f"  {speaker_col_label:<{name_width}}"
+        f"  {words_col_label:>{words_width}}"
+        f"  {duration_col_label:>{duration_width}}"
+        f"  {wpm_col_label:>{wpm_width}}"
+        f"  {pct_col_label:>{pct_width}}"
+    )
+    separator_width = len(header_line.rstrip())
+    separator = "  " + "─" * (separator_width - 2)
+
+    output_lines: list[str] = [
+        f"# analysis: {source_name}",
+        f"# duration: {duration_minutes} min",
+        f"# speakers: {len(speaker_order)}",
+        "",
+        header_line.rstrip(),
+        separator,
+    ]
+
+    for speaker in speaker_order:
+        word_count = speaker_word_counts[speaker]
+        duration_min = round(speaker_durations[speaker] / 60)
+        duration_str = f"{duration_min} min"
+        wpm = speaker_wpm[speaker]
+        pct_str = f"{speaker_pct[speaker]}%"
+        row = (
+            f"  {speaker:<{name_width}}"
+            f"  {word_count:>{words_width}}"
+            f"  {duration_str:>{duration_width}}"
+            f"  {wpm:>{wpm_width}}"
+            f"  {pct_str:>{pct_width}}"
+        )
+        output_lines.append(row.rstrip())
+
+    output_lines.append(separator)
+
+    total_duration_min = round(total_duration_seconds / 60)
+    total_duration_str = f"{total_duration_min} min"
+    total_row = (
+        f"  {'Total':<{name_width}}"
+        f"  {total_words:>{words_width}}"
+        f"  {total_duration_str:>{duration_width}}"
+        f"  {total_wpm:>{wpm_width}}"
+        f"  {'100%':>{pct_width}}"
+    )
+    output_lines.append(total_row.rstrip())
+
+    return "\n".join(output_lines)
+
+
 def convert_vtt_to_txt(vtt_path: str, output_path: str | None = None) -> None:
     """Convert a VTT file to IRC-style timestamped text."""
     vtt_file = Path(vtt_path)
@@ -225,7 +458,7 @@ def summarize_vtt(
     body = format_body(grouped)
     transcript_text = f"{header}\n\n{body}\n"
 
-    # call LLM via OpenAI-compatible API — no sdk needed
+    # call litellm proxy directly via stdlib — no sdk needed
     request_body = json.dumps(
         {
             "model": model,
@@ -276,6 +509,24 @@ def summarize_vtt(
     print(f"{output_path}")
 
 
+def analyze_command(vtt_path: str, sort_by: str = "speaker") -> None:
+    """Validate file exists, parse with duration, and print speaker analysis."""
+    vtt_file = Path(vtt_path)
+
+    if not vtt_file.exists():
+        print(f"[error] file '{vtt_path}' not found", file=sys.stderr)
+        sys.exit(1)
+
+    timed_entries = parse_vtt_with_duration(vtt_path)
+
+    if not timed_entries:
+        print(f"[error] no entries found in '{vtt_path}'", file=sys.stderr)
+        sys.exit(1)
+
+    analysis = analyze_speakers(timed_entries, vtt_file, sort_by)
+    print(analysis)
+
+
 def main() -> None:
     """CLI entry point with subcommands."""
     parser = argparse.ArgumentParser(
@@ -316,6 +567,20 @@ def main() -> None:
         help="custom system prompt",
     )
 
+    # analyze subcommand
+    analyze_parser = subparsers.add_parser(
+        "analyze",
+        help="analyze speaker statistics",
+    )
+    analyze_parser.add_argument("vtt_file", help="path to VTT file")
+    analyze_parser.add_argument(
+        "--sort",
+        "-s",
+        choices=["speaker", "duration", "words", "wpm"],
+        default="speaker",
+        help="sort by column (default: speaker)",
+    )
+
     args = parser.parse_args()
 
     if args.command is None:
@@ -331,7 +596,9 @@ def main() -> None:
             system_prompt = PLAN_SYSTEM_PROMPT
         else:
             system_prompt = SUMMARY_SYSTEM_PROMPT
-        summarize_vtt(args.vtt_file, args.output, args.model, system_prompt, args.base_url)
+        summarize_vtt(args.vtt_file, args.output, args.model, system_prompt)
+    elif args.command == "analyze":
+        analyze_command(args.vtt_file, args.sort)
 
 
 if __name__ == "__main__":
